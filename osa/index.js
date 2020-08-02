@@ -74,6 +74,7 @@ function nameForHandle(handle) {
 function send(handle, message, service = "SMS") {
   assert(typeof handle == "string", "handle must be a string");
   assert(typeof message == "string", "message must be a string");
+
   return osa((handle, message, service) => {
     const Messages = Application("Messages");
 
@@ -81,9 +82,12 @@ function send(handle, message, service = "SMS") {
 
     try {
       const options = Messages.buddies.whose({ handle: handle });
+
       let chosenIndex = 0;
+
       for (let index = 0; index < options.length; index++) {
         const option = options[index];
+
         if (option.service.name().toLowerCase() === service.toLowerCase()) {
           chosenIndex = index;
         }
@@ -125,33 +129,48 @@ function listen() {
 
   async function check() {
     const db = await dbPromise;
+
     const query = `
-            SELECT
-                guid,
-                id as handle,
-                message.service,
-                account,
-                text,
-                date,
-                date_read,
-                is_from_me,
-                cache_roomnames
-            FROM message
-            LEFT OUTER JOIN handle ON message.handle_id = handle.ROWID
-            WHERE date >= ${last}
-        `;
+      SELECT
+        message.ROWID,
+        message.guid AS guid,
+        chat_message_join.chat_id AS chat,
+        handle.id as handle,
+        message.service,
+        message.account,
+        message.text,
+        GROUP_CONCAT(attachment.filename) AS attachments,
+        message.date,
+        message.date_read,
+        message.is_from_me,
+        message.cache_roomnames
+      FROM message
+      LEFT OUTER JOIN handle ON message.handle_id = handle.ROWID
+      LEFT OUTER JOIN chat_message_join ON message.ROWID = chat_message_join.message_id
+      LEFT OUTER JOIN message_attachment_join ON message.ROWID = message_attachment_join.message_id
+      LEFT OUTER JOIN attachment ON attachment.ROWID = message_attachment_join.attachment_id
+      WHERE message.date >= ${last}
+      GROUP BY message.ROWID`;
+
     last = packTimeConditionally(appleTimeNow());
 
     try {
       const messages = await db.all(query);
+
       messages.forEach((msg) => {
         if (emittedMsgs[msg.guid]) return;
+
         emittedMsgs[msg.guid] = true;
+
+        const attachments = (msg.attachments) ? msg.attachments.split(",") : [];
+
         emitter.emit("message", {
           raw: msg,
           guid: msg.guid,
-          text: msg.text,
+          chat: msg.chat,
           handle: msg.handle,
+          text: msg.text,
+          attachments: attachments,
           service: msg.service === "SMS" ? msg.service : msg.account,
           group: msg.cache_roomnames,
           fromMe: !!msg.is_from_me,
@@ -159,10 +178,13 @@ function listen() {
           dateRead: fromAppleTime(msg.date_read),
         });
       });
+
       setTimeout(check, 1000);
     } catch (err) {
       bail = true;
+
       emitter.emit("error", err);
+
       warn(`sqlite returned an error while polling for new messages!
                   bailing out of poll routine for safety. new messages will
                   not be detected`);
@@ -170,110 +192,125 @@ function listen() {
   }
 
   if (bail) return;
+
   check();
 
   return emitter;
 }
 
-async function getRecentChats(limit = 10) {
+async function getHandles() {
   try {
     const db = await messagesDb.open();
 
     const query = `
-        SELECT
-            *
-        FROM chat
-        JOIN chat_handle_join ON chat_handle_join.chat_id = chat.ROWID
-        JOIN handle ON handle.ROWID = chat_handle_join.handle_id
-        ORDER BY chat.last_read_message_timestamp DESC
-        LIMIT ${limit};
-    `;
+      SELECT
+        ROWID as handle,
+        id,
+        country,
+        service
+      FROM handle`;
 
-    const chats = await db.all(query);
-    return chats;
+    const handles = await db.all(query);
+
+    return handles;
   } catch (e) {
     console.log(e);
     return [];
   }
 }
 
-async function getRecentChatsFromId(id) {
+async function getRecentContacts(limit = 50) {
   try {
     const db = await messagesDb.open();
-    if (!id)
-      console.error(
-        "Tried requesting messages from a user which doesn't exist..."
-      );
 
     const query = `
-            SELECT
-                guid,
-                id as handle,
-                message.service,
-                account,
-                text,
-                date,
-                date_read,
-                is_from_me,
-                cache_roomnames
-            FROM message
-            LEFT OUTER JOIN handle ON message.handle_id = handle.ROWID
-            WHERE message.handle_id = ${id}
-            ORDER BY message.date DESC
-            LIMIT 10`;
+      SELECT
+        chat.ROWID AS id,
+        chat.guid,
+        GROUP_CONCAT(handle.ROWID) AS handles,
+        chat.account_id,
+        chat.last_addressed_handle
+      FROM chat
+      JOIN chat_handle_join ON chat_handle_join.chat_id = chat.ROWID
+      JOIN handle ON handle.ROWID = chat_handle_join.handle_id
+      GROUP BY chat.ROWID
+      ORDER BY chat.last_read_message_timestamp DESC
+      LIMIT ${limit}`;
 
-    const recents = await db.all(query);
-    return recents;
+    const chats = await db.all(query);
+
+    const processed = chats.map((chat) => {
+      const handles = chat.handles.split(",");
+
+      return {
+        ...chat,
+        handles
+      };
+    });
+
+    return processed;
   } catch (e) {
-    warn(e);
+    console.log(e);
     return [];
   }
 }
 
-// get attachments for given handle_id
-async function getAttachmentsFromId(id, limit = 10) {
-  const db = await messagesDb.open();
+async function getRecentMessagesFromChat(id, offset = 0, limit = 50) {
+  try {
+    const db = await messagesDb.open();
 
-  const query = `
-        SELECT
-            *
-        FROM message
-        INNER JOIN message_attachment_join ON message.ROWID = message_attachment_join.message_id
-        INNER JOIN attachment ON attachment.ROWID = message_attachment_join.attachment_id
-        WHERE message.handle_id = ${id}
-        LIMIT ${limit}
-    `;
+    if (!id) {
+      console.error("Required argument: id");
 
-  const attachments = await db.all(query);
-  return attachments;
-}
+      return [];
+    }
 
-// get attachments for given handle_id
-async function getRecentAttachments(limit = 10) {
-  const db = await messagesDb.open();
+    const query = `
+      SELECT
+        message.ROWID as message,
+        message.guid AS guid,
+        handle.id as handle,
+        message.service,
+        message.account,
+        message.text,
+        GROUP_CONCAT(attachment.filename) AS attachments,
+        message.date,
+        message.date_read,
+        message.is_from_me,
+        message.cache_roomnames
+      FROM message
+      LEFT OUTER JOIN handle ON message.handle_id = handle.ROWID
+      LEFT OUTER JOIN chat_message_join ON message.ROWID = chat_message_join.message_id
+      LEFT OUTER JOIN message_attachment_join ON message.ROWID = message_attachment_join.message_id
+      LEFT OUTER JOIN attachment ON attachment.ROWID = message_attachment_join.attachment_id
+      WHERE chat_message_join.chat_id = ${id}
+      GROUP BY message.ROWID
+      ORDER BY message.date DESC
+      LIMIT ${limit}`;
 
-  const query = `
-        SELECT
-            *
-        FROM message
-        INNER JOIN message_attachment_join ON message.ROWID = message_attachment_join.message_id
-        INNER JOIN attachment ON attachment.ROWID = message_attachment_join.attachment_id
-        LIMIT ${limit}
-    `;
+    const recents = await db.all(query);
 
-  const attachments = await db.all(query);
-  return attachments;
+    return recents.map((recent) => {
+      const attachments = (recent.attachments) ? recent.attachments.split(",") : [];
+
+      return {
+        ...recent,
+        attachments
+      };
+    });
+  } catch (e) {
+    console.log(e);
+    return [];
+  }
 }
 
 module.exports = {
   send,
   listen,
-  /*    attachentListen,*/
   handleForName,
   nameForHandle,
-  getRecentChats,
-  getRecentChatsFromId,
-  getRecentAttachments,
-  getAttachmentsFromId,
+  getHandles,
+  getRecentContacts,
+  getRecentMessagesFromChat,
   SUPPRESS_WARNINGS: false,
 };

@@ -18,6 +18,7 @@ function notifRelay(s) {
 
 function joinRoom() {
   console.log(process.argv[2], process.argv[3]);
+
   socket.emit(
     "client:authenticate",
     {
@@ -45,7 +46,9 @@ function joinRoom() {
 
 function checkForParams() {
   if (process.argv[3] && process.argv[2]) return;
+
   console.error("Missing parameters! Exiting...");
+
   process.exit();
 }
 
@@ -56,39 +59,48 @@ let socket = require("socket.io-client")(process.argv[2]);
 async function auth() {
   notifRelay(process.argv[3].substring(0, 8));
   joinRoom();
+
   return true;
 }
 
 auth().then(() => {
   console.info("Connected to relay with secret UUID: " + process.argv[3]);
+
   let self = this;
 
   socket.on("raw", (req) => {
     console.log(req);
 
-    if (req.type === "getAttachmentsFromId") {
-      let ret = iMessage.getAttachmentsFromId(id).then((c) => {
-        c.forEach((attachment) => {
-          fs.readFile(
-            attachment.filename.replace("~", getUserHome()),
-            function (err, buf) {
-              stats.fileSent++;
-              socket.emit("raw", {
-                type: "fileTranser",
-                details: attachment,
-                handle: handle_id,
-                buffer: buf.toString("base64"),
-              });
-            }
-          );
-        });
-      });
+    if (req.type === "handles") {
+      iMessage.getHandles().then((handles) => {
+        socket.emit("raw", { type: "handles", data: handles })
+      })
     }
 
     if (req.type === "recentContacts") {
-      iMessage.getRecentChats(50).then((c) => {
+      iMessage.getRecentContacts(50).then((c) => {
         socket.emit("raw", { type: "recentContacts", data: c });
       });
+    }
+
+    if (req.type === "recentMessages") {
+      iMessage.getRecentMessagesFromChat(req.id).then((c) => {
+        socket.emit("raw", { type: "recentMessages", id: req.id, data: c });
+      });
+    }
+
+    if (req.type === "attachment") {
+      const filename = req.filename
+
+      fs.readFile(filename.replace("~", getUserHome()), (err, buf) => {
+        stats.fileSent++;
+
+        socket.emit("raw", {
+          type: "fileTransfer",
+          filename: filename,
+          buffer: buf.toString("base64")
+        });
+      })
     }
 
     if (req.type === "send") {
@@ -102,12 +114,6 @@ auth().then(() => {
     if (req.type === "ping") {
       notifRelay(process.argv[3]);
     }
-
-    if (req.type === "recentChats") {
-      iMessage.getRecentChatsFromId(req.id).then((c) => {
-        socket.emit("raw", { type: "recentChats", id: req.id, data: c });
-      });
-    }
   });
 
   socket.on("join", (s) => {
@@ -116,6 +122,8 @@ auth().then(() => {
 });
 
 iMessage.listen().on("message", (msg) => {
+  console.log("Received message: ", msg);
+
   if (msg.fromMe) return;
   wsRelay(msg);
 });
