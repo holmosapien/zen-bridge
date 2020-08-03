@@ -90,17 +90,16 @@ auth().then(() => {
     }
 
     if (req.type === "attachment") {
-      const filename = req.filename
+      const requestedFilename = req.filename;
+      const actualFilename = req.filename.replace("~", getUserHome());
 
-      fs.readFile(filename.replace("~", getUserHome()), (err, buf) => {
-        stats.fileSent++;
-
+      fs.readFile(actualFilename, (err, buf) => {
         socket.emit("raw", {
           type: "fileTransfer",
-          filename: filename,
+          filename: requestedFilename,
           buffer: buf.toString("base64")
         });
-      })
+      });
     }
 
     if (req.type === "send") {

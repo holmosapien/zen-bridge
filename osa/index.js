@@ -54,6 +54,7 @@ function packTimeConditionally(ts) {
 // Gets the proper handle string for a contact with the given name
 function handleForName(name) {
   assert(typeof name == "string", "name must be a string");
+
   return osa((name) => {
     const Messages = Application("Messages");
     return Messages.buddies.whose({ name: name })[0].handle();
@@ -64,6 +65,7 @@ function handleForName(name) {
 // TODO: support group chats
 function nameForHandle(handle) {
   assert(typeof handle == "string", "handle must be a string");
+
   return osa((handle) => {
     const Messages = Application("Messages");
     return Messages.buddies.whose({ handle: handle }).name()[0];
@@ -204,13 +206,23 @@ async function getHandles() {
 
     const query = `
       SELECT
-        ROWID as handle,
-        id,
+        id AS handle,
         country,
         service
       FROM handle`;
 
-    const handles = await db.all(query);
+    let handles = await db.all(query);
+
+    /*
+     * Fetch the real names for each of the handles.
+     *
+     */
+
+    const promises = handles.map((handle) => (handle.handle) ? nameForHandle(handle.handle) : undefined);
+
+    await Promise.all(promises).then((names) => {
+      handles.forEach((handle, index) => handles[index].name = names[index]);
+    });
 
     return handles;
   } catch (e) {
@@ -227,7 +239,7 @@ async function getRecentContacts(limit = 50) {
       SELECT
         chat.ROWID AS id,
         chat.guid,
-        GROUP_CONCAT(handle.ROWID) AS handles,
+        GROUP_CONCAT(handle.id) AS handles,
         chat.account_id,
         chat.last_addressed_handle
       FROM chat
